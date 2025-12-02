@@ -3,7 +3,6 @@ from pydantic import BaseModel
 import ccxt.async_support as ccxt
 import os
 from datetime import datetime
-import urllib.parse
 import json
 
 app = FastAPI(title="Nova + Ascendex Bot - OPERANDO 24/7")
@@ -12,20 +11,20 @@ exchange = ccxt.ascendex({
     'apiKey': os.getenv("ASCENDEX_API_KEY"),
     'secret': os.getenv("ASCENDEX_SECRET"),
     'enableRateLimit': True,
-    'options': {'defaultType': 'future'}
+    'options': {'defaultType': 'swap'}  # swap = futuros perpetuos en Ascendex
 })
 
 class Signal(BaseModel):
-    exchange: str
-    symbol: str
-    market: str
     action: str
-    price: str
+    symbol: str
     quantity: str
+    price: float
     stop_loss: float = None
     take_profit: float = None
-    orderId: str
-    timestamp: str
+    exchange: str
+    market: str
+    orderId: str = None
+    timestamp: str = None
 
 @app.get("/")
 async def home():
@@ -36,41 +35,42 @@ async def webhook(request: Request):
     try:
         raw_body = await request.body()
         body_text = raw_body.decode("utf-8").strip()
+        
+        print(f"RAW recibido ({len(body_text)} chars): {body_text[:500]}")
 
-        print(f"RAW recibido: {body_text[:200]}")  # <-- para ver exactamente qué llega
-
-        # Caso TradingView: message={....}
-        if body_text.startswith("message="):
-            json_str = body_text[8:]
-            json_str = urllib.parse.unquote(json_str)
-            payload = json.loads(json_str)
-        else:
-            # Caso JSON directo o cualquier otra cosa
-            payload = json.loads(body_text) if body_text else {}
+        # TradingView ahora envía JSON directo → lo intentamos parsear directamente
+        payload = json.loads(body_text)
+        
+        # Pequeño fix por si Ascendex usa SOL/USDT en vez de SOLUSDT
+        symbol = payload["symbol"]
+        if symbol.endswith("USDT"):
+            symbol = symbol.replace("USDT", "/USDT:USDT")
 
         signal = Signal(**payload)
 
-        print(f"\n[{datetime.now()}] SEÑAL RECIBIDA → {signal.orderId}")
-        print(f"→ {signal.action} {signal.quantity} {signal.symbol} @ {signal.price}")
+        print(f"\n[{datetime.now()}] SEÑAL → {signal.action.upper()} {signal.quantity} {signal.symbol} @ {signal.price}")
+        print(f"SL: {signal.stop_loss} | TP: {signal.take_profit} | ID: {signal.orderId}")
 
-        side = "buy" if signal.action == "BUY" else "sell"
-        symbol = signal.symbol.replace("USDT", "/USDT:USDT")
+        side = "buy" if signal.action.lower() == "buy" else "sell"
 
+        # Orden principal al mercado
         order = await exchange.create_market_order(symbol, side, float(signal.quantity))
         print(f"ORDEN EJECUTADA → {order['id']}")
 
+        # Stop-loss (si existe)
         if signal.stop_loss:
-            await exchange.create_stop_order(symbol, "sell" if side == "buy" else "buy",
-                                           float(signal.quantity), None, {"stopPrice": signal.stop_loss})
-            print(f"SL colocado en {signal.stop_loss}")
+            sl_side = "sell" if side == "buy" else "buy"
+            await exchange.create_order(symbol, "stop", sl_side, float(signal.quantity), None, {"stopPrice": signal.stop_loss})
+            print(f"STOP-LOSS colocado en {signal.stop_loss}")
 
+        # Take-profit (limit normal)
         if signal.take_profit:
-            await exchange.create_limit_order(symbol, "sell" if side == "buy" else "buy",
-                                            float(signal.quantity), signal.take_profit)
-            print(f"TP colocado en {signal.take_profit}")
+            tp_side = "sell" if side == "buy" else "buy"
+            await exchange.create_limit_order(symbol, tp_side, float(signal.quantity), signal.take_profit)
+            print(f"TAKE-PROFIT colocado en {signal.take_profit}")
 
         return {"status": "EJECUTADO", "order_id": order['id']}
 
     except Exception as e:
-        print(f"ERROR → {e}")   # <-- aquí estaba el puto printprix
-        return {"status": "ERROR", "msg": str(e)}
+        print(f"ERROR → {e}")
+        return {"status": "ERROR", "msg": str(e)}, 400
